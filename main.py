@@ -23,6 +23,9 @@ P_grid_max = params["P_grid_max"]           # MW - max snaga povlačenja iz mre�
 PENALTY_DEFICIT = params["PENALTY_DEFICIT"] # EUR/MWh - kazneni trošak za manjak EE
 P_solar_inst = params["P_solar_installed"]  # MW - instalirana snaga solarne elektrane
 n_bat_min = params["n_bat_min"]             # h - min broj sati u istom režimu (punjenje/pražnjenje)
+price_export = params["price_export"]       # EUR/MWh - cijena prodaje solarne EE u mrežu
+eta_chg = params["eta_charge"]              # efikasnost punjenja (0-1)
+eta_dis = params["eta_discharge"]           # efikasnost pražnjenja (0-1)
 
 # Stvarna solarna proizvodnja u MW (normalizirani profil 0-1 * instalirana snaga u MW)
 solar_prod = [s * P_solar_inst for s in solar_norm]  # MW
@@ -44,17 +47,18 @@ inf = highspy.kHighsInf
 #   soc[t]         - stanje napunjenosti [15, 90] %           t = 0..T-1
 #   p_deficit[t]   - manjak EE [0, inf) MW                    t = 0..T-1
 #   p_curtail[t]   - curtailment solarne el. [0, solar_prod]  t = 0..T-1
-#   y_chg[t]       - binarna: 1=punjenje aktivno             t = 0..T-1
+#   y_chg[t]       - binarna: 1=punjenje aktivno              t = 0..T-1
 #   y_dis[t]       - binarna: 1=pražnjenje aktivno           t = 0..T-1
+#   p_export[t]    - prodaja solarne EE u mrežu [0, solar]   t = 0..T-1
 
-num_vars = 8 * T
+num_vars = 9 * T
 col_lower = []
 col_upper = []
 col_cost = []
 
 # Indeksi varijabli - grupirani po satu:
 #   t=0: [grid_0, charge_0, discharge_0, soc_0], t=1: [grid_1, charge_1, ...], ...
-N_VAR_PER_T = 8
+N_VAR_PER_T = 9
 def idx_grid(t):      return N_VAR_PER_T * t
 def idx_charge(t):    return N_VAR_PER_T * t + 1
 def idx_discharge(t): return N_VAR_PER_T * t + 2
@@ -63,6 +67,7 @@ def idx_deficit(t):   return N_VAR_PER_T * t + 4
 def idx_curtail(t):   return N_VAR_PER_T * t + 5
 def idx_ychg(t):      return N_VAR_PER_T * t + 6
 def idx_ydis(t):      return N_VAR_PER_T * t + 7
+def idx_export(t):    return N_VAR_PER_T * t + 8
 
 for t in range(T):
     # p_grid[t]
@@ -105,6 +110,12 @@ for t in range(T):
     col_upper.append(1.0)
     col_cost.append(0.0)
 
+    # p_export[t] - prodaja solarne EE u mrežu [0, solar_prod[t]]
+    # negativan trošak = prihod (smanjuje ukupni trošak)
+    col_lower.append(0.0)
+    col_upper.append(solar_prod[t])
+    col_cost.append(-price_export)
+
 h.addVars(num_vars, col_lower, col_upper)
 
 # Postavi y_chg i y_dis kao binarne (integer) varijable
@@ -120,25 +131,28 @@ h.changeObjectiveSense(highspy.ObjSense.kMinimize)
 # Ograničenja:
 
 # 1) Energetska ravnoteža:
-#    p_grid + p_discharge - p_charge - p_curtail + p_deficit = consumption - solar_prod
+#    p_grid + eta_dis*p_discharge - p_charge - p_curtail - p_export + p_deficit = consumption - solar_prod
+#    (pražnjenje daje eta_dis * p_discharge korisne energije)
 for t in range(T):
     rhs = consumption[t] - solar_prod[t]
-    indices = [idx_grid(t), idx_discharge(t), idx_charge(t), idx_curtail(t), idx_deficit(t)]
-    values = [1.0, 1.0, -1.0, -1.0, 1.0]
+    indices = [idx_grid(t), idx_discharge(t), idx_charge(t), idx_curtail(t), idx_export(t), idx_deficit(t)]
+    values = [1.0, eta_dis, -1.0, -1.0, -1.0, 1.0]
     h.addRow(rhs, rhs, len(indices), indices, values)
 
-# 2) Dinamika SOC-a: soc[t] (%) = soc[t-1] (%) + (p_charge[t] - p_discharge[t]) / E_bat * 100
-#    => soc[t] - (100/E_bat)*p_charge[t] + (100/E_bat)*p_discharge[t] = soc[t-1]
+# 2) Dinamika SOC-a s efikasnošću:
+#    soc[t] = soc[t-1] + eta_chg*p_charge[t]*pct - p_discharge[t]*pct
+#    (punjenje: samo eta_chg energije dolazi u bateriju, pražnjenje: uzima punu energiju iz baterije)
+#    => soc[t] - eta_chg*pct*p_charge[t] + pct*p_discharge[t] = soc[t-1]
 pct_factor = 100.0 / E_bat  # pretvorba MW*1h -> % kapaciteta
 for t in range(T):
     soc_prev = SOC_init if t == 0 else None
     if t == 0:
         indices = [idx_soc(t), idx_charge(t), idx_discharge(t)]
-        values = [1.0, -pct_factor, pct_factor]
+        values = [1.0, -eta_chg * pct_factor, pct_factor]
         h.addRow(soc_prev, soc_prev, len(indices), indices, values)
     else:
         indices = [idx_soc(t), idx_soc(t - 1), idx_charge(t), idx_discharge(t)]
-        values = [1.0, -1.0, -pct_factor, pct_factor]
+        values = [1.0, -1.0, -eta_chg * pct_factor, pct_factor]
         h.addRow(0.0, 0.0, len(indices), indices, values)
 
 # 3) Max snaga pražnjenja ovisi o SOC-u (konkavna funkcija -> LP bez binarnih varijabli):
@@ -200,7 +214,28 @@ for t in range(T):
     values = [1.0]
     h.addRow(-inf, P_bat - aFRRminus[t], len(indices), indices, values)
 
-# 5) Zabrana istovremenog punjenja i pražnjenja + minimalno trajanje režima:
+    # aFRR+ energijska rezerva: SOC mora biti dovoljno visok da isporuči aFRRplus 1 sat
+    #   SOC[t] >= SOC_min + aFRRplus[t] * pct_factor
+    #   => SOC[t] >= 15 + aFRRplus[t] * (100/E_bat)
+    indices = [idx_soc(t)]
+    values = [1.0]
+    h.addRow(15.0 + aFRRplus[t] * pct_factor, inf, len(indices), indices, values)
+
+    # aFRR- energijska rezerva: SOC mora biti dovoljno nizak da primi aFRRminus 1 sat
+    #   SOC[t] <= SOC_max - aFRRminus[t] * pct_factor
+    #   => SOC[t] <= 90 - aFRRminus[t] * (100/E_bat)
+    indices = [idx_soc(t)]
+    values = [1.0]
+    h.addRow(-inf, 90.0 - aFRRminus[t] * pct_factor, len(indices), indices, values)
+
+# 5a) Ograničenje prodaje: export + curtailment <= solar_prod
+#     (ne možemo prodati + curtailati više nego što solar proizvodi)
+for t in range(T):
+    indices = [idx_export(t), idx_curtail(t)]
+    values = [1.0, 1.0]
+    h.addRow(-inf, solar_prod[t], len(indices), indices, values)
+
+# 5b) Zabrana istovremenog punjenja i pražnjenja + minimalno trajanje režima:
 #    y_chg[t] + y_dis[t] <= 1              (ne može oboje u istom satu)
 #    p_charge[t]    <= P_bat * y_chg[t]    (punjenje samo ako y_chg=1)
 #    p_discharge[t] <= P_bat * y_dis[t]    (pražnjenje samo ako y_dis=1)
@@ -248,15 +283,23 @@ if status == 2:  # feasible
     E_deficit_total = sum(max(0.0, sol[idx_deficit(t)]) for t in range(T))
     E_solar_total = sum(solar_prod)
     E_curtail_total = sum(max(0.0, sol[idx_curtail(t)]) for t in range(T))
+    E_export_total = sum(max(0.0, sol[idx_export(t)]) for t in range(T))
+    R_export_total = E_export_total * price_export
 
     print(f"Ukupno preuzeto iz mreže: {E_grid_total:,.2f} MWh")
     print(f"Ukupna potrošnja:         {sum(consumption):,.2f} MWh")
     print(f"Solarna proizvodnja:      {E_solar_total:,.2f} MWh")
+    print(f"Prodano u mrežu:          {E_export_total:,.2f} MWh  ({R_export_total:,.2f} EUR)")
     print(f"Curtailment solara:       {E_curtail_total:,.2f} MWh")
     print(f"Ukupni manjak EE:         {E_deficit_total:,.2f} MWh")
-    print(f"Optimalni tjedni trošak:  {obj:,.2f} EUR")
-    print(f"Trošak bez baterije:      {sum(p * c for p, c in zip(prices, consumption)):,.2f} EUR")
-    print(f"Ušteda:                   {sum(p * c for p, c in zip(prices, consumption)) - obj:,.2f} EUR")
+    # Trošak bez penala za manjak
+    cost_no_penalty = obj - E_deficit_total * PENALTY_DEFICIT
+    cost_no_bat = sum(p * c for p, c in zip(prices, consumption))
+    print(f"Optimalni tjedni trošak:  {cost_no_penalty:,.2f} EUR (bez penala za manjak)")
+    print(f"Trošak bez baterije:      {cost_no_bat:,.2f} EUR (bez penala za manjak)")
+    print(f"Ušteda:                   {cost_no_bat - cost_no_penalty:,.2f} EUR")
+    if E_deficit_total > 0.001:
+        print(f"  *** PAŽNJA: konzum nije u potpunosti namiren ({E_deficit_total:,.2f} MWh manjka) ***")
     print()
 
     for day in range(7):
@@ -273,19 +316,20 @@ if status == 2:  # feasible
         start = day * 24
         end = start + 24
         print(f"\nDetaljni sat-po-sat ({day_name}):")
-        print(f"{'Sat':>4} | {'Cijena':>8} | {'Potraž.':>7} | {'Solar':>5} | {'Mreža':>6} | {'Punj.':>6} | {'Praž.':>6} | {'Curt.':>5} | {'Manj.':>6} | {'aFRR+':>5} | {'aFRR-':>5} | {'SOC %':>6}")
-        print("-" * 110)
+        print(f"{'Sat':>4} | {'Cijena':>8} | {'Potraž.':>7} | {'Solar':>5} | {'Mreža':>6} | {'Punj.':>6} | {'Praž.':>6} | {'Export':>6} | {'Curt.':>5} | {'Manj.':>6} | {'aFRR+':>5} | {'aFRR-':>5} | {'SOC %':>6}")
+        print("-" * 120)
         for t in range(start, end):
             v_grid = max(0.0, sol[idx_grid(t)])
             v_chg  = max(0.0, sol[idx_charge(t)])
             v_dis  = max(0.0, sol[idx_discharge(t)])
             v_def  = max(0.0, sol[idx_deficit(t)])
             v_cur  = max(0.0, sol[idx_curtail(t)])
+            v_exp  = max(0.0, sol[idx_export(t)])
             v_soc  = sol[idx_soc(t)]
             print(f"{t - start:4d} | {prices[t]:7.1f}  | {consumption[t]:6.1f}  | {solar_prod[t]:4.2f}  | {v_grid:5.2f}  | "
-                  f"{v_chg:5.2f}  | {v_dis:5.2f}  | {v_cur:4.2f}  | {v_def:5.2f}  | {aFRRplus[t]:4.1f}  | {aFRRminus[t]:4.1f}  | {v_soc:5.1f}%")
-    # Dijagram za ponedjeljak + utorak (48 sati)
-    H = 48
+                  f"{v_chg:5.2f}  | {v_dis:5.2f}  | {v_exp:5.2f}  | {v_cur:4.2f}  | {v_def:5.2f}  | {aFRRplus[t]:4.1f}  | {aFRRminus[t]:4.1f}  | {v_soc:5.1f}%")
+    # Dijagram za 3 dana (72 sata)
+    H = 72+24
     hours = list(range(H))
 
     d_grid = np.array([max(0.0, sol[idx_grid(t)]) for t in range(H)])
@@ -293,6 +337,7 @@ if status == 2:  # feasible
     d_dis  = np.array([max(0.0, sol[idx_discharge(t)]) for t in range(H)])
     d_def  = np.array([max(0.0, sol[idx_deficit(t)]) for t in range(H)])
     d_cur  = np.array([max(0.0, sol[idx_curtail(t)]) for t in range(H)])
+    d_exp  = np.array([max(0.0, sol[idx_export(t)]) for t in range(H)])
     d_sol  = np.array(solar_prod[:H])
     d_soc  = np.array([sol[idx_soc(t)] for t in range(H)])
     d_price = np.array(prices[:H])
@@ -300,8 +345,18 @@ if status == 2:  # feasible
     d_afrr_p = np.array(aFRRplus[:H])
     d_afrr_m = np.array(aFRRminus[:H])
 
-    fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
-    fig.suptitle("Rezultati optimizacije - Monday + Tuesday", fontsize=14, fontweight="bold")
+    fig, axes = plt.subplots(3, 1, figsize=(22, 12), sharex=True)
+    fig.suptitle("Rezultati optimizacije - Monday + Tuesday + Wednesday", fontsize=14, fontweight="bold")
+
+    # Tekstualni ispis troškova na dijagramu
+    info_text = (f"Optimalni tjedni trošak: {cost_no_penalty:,.2f} EUR\n"
+                 f"Trošak bez baterije:     {cost_no_bat:,.2f} EUR\n"
+                 f"Ušteda:                  {cost_no_bat - cost_no_penalty:,.2f} EUR")
+    if E_deficit_total > 0.001:
+        info_text += f"\n*** PAŽNJA: konzum nije u potpunosti namiren ({E_deficit_total:,.2f} MWh manjka) ***"
+    fig.text(0.99, 0.01, info_text, fontsize=10, fontfamily="monospace",
+             horizontalalignment="right", verticalalignment="bottom", multialignment="left",
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="lightyellow", alpha=0.8))
 
     # Graf 1: Snage - stacked bar za izvore, linija za potrošnju
     ax1 = axes[0]
@@ -312,50 +367,50 @@ if status == 2:  # feasible
     ax1.bar(hours, d_dis, bar_width, bottom=d_grid + d_sol, label="Pražnjenje bat.", color="red")
     if d_def.max() > 0.001:
         ax1.bar(hours, d_def, bar_width, bottom=d_grid + d_sol + d_dis, label="Manjak", color="magenta")
-    # Negativna strana: punjenje baterije + curtailment
+    # Negativna strana: punjenje baterije + export + curtailment
     ax1.bar(hours, -d_chg, bar_width, label="Punjenje bat.", color="green")
-    ax1.bar(hours, -d_cur, bar_width, bottom=-d_chg, label="Curtailment", color="orange")
+    ax1.bar(hours, -d_exp, bar_width, bottom=-d_chg, label="Export", color="cyan")
+    ax1.bar(hours, -d_cur, bar_width, bottom=-d_chg - d_exp, label="Curtailment", color="orange")
     ax1.step(hours, d_cons, where="mid", label="Potrošnja", linewidth=2, color="black", linestyle="--")
     ax1.axvline(x=24, color="gray", linestyle="--", alpha=0.5)
+    ax1.axvline(x=48, color="gray", linestyle="--", alpha=0.5)
     ax1.set_ylabel("Snaga [MW]")
     ax1.legend(loc="upper right", fontsize=8)
     ax1.grid(True, alpha=0.3)
     ax1.set_title("Energetska bilanca")
 
-    # Graf 2: SOC baterije
+    # Graf 2: SOC baterije + efektivne granice (sve u %)
     ax2 = axes[1]
-    ax2.step(hours, d_soc, where="mid", linewidth=2, color="darkorange")
-    ax2.axhline(y=15, color="red", linestyle=":", alpha=0.5, label="SOC min (15%)")
-    ax2.axhline(y=90, color="red", linestyle=":", alpha=0.5, label="SOC max (90%)")
+    # Efektivne SOC granice s aFRR rezervom (u %)
+    soc_lower = 15.0 + d_afrr_p * pct_factor   # SOC_min + aFRR+ rezerva
+    soc_upper = 90.0 - d_afrr_m * pct_factor   # SOC_max - aFRR- rezerva
+    ax2.step(hours, d_soc, where="mid", linewidth=2, color="darkorange", label="SOC")
+    ax2.step(hours, soc_lower, where="mid", linewidth=1.5, color="crimson", linestyle="-.", label=f"SOC min + aFRR+")
+    ax2.step(hours, soc_upper, where="mid", linewidth=1.5, color="forestgreen", linestyle="-.", label=f"SOC max - aFRR-")
+    ax2.axhline(y=15, color="red", linestyle=":", alpha=0.3, label="SOC min (15%)")
+    ax2.axhline(y=90, color="red", linestyle=":", alpha=0.3, label="SOC max (90%)")
     ax2.fill_between(hours, d_soc, alpha=0.2, step="mid", color="orange")
     ax2.axvline(x=24, color="gray", linestyle="--", alpha=0.5)
+    ax2.axvline(x=48, color="gray", linestyle="--", alpha=0.5)
     ax2.set_ylabel("SOC [%]")
     ax2.set_ylim(0, 100)
     ax2.legend(loc="upper right", fontsize=8)
     ax2.grid(True, alpha=0.3)
-    ax2.set_title("Stanje napunjenosti baterije (SOC)")
+    ax2.set_title("Stanje napunjenosti baterije (SOC) i aFRR granice")
 
-    # Graf 3: Cijena i aFRR
+    # Graf 3: Cijena
     ax3 = axes[2]
     ax3.step(hours, d_price, where="mid", linewidth=2, color="darkblue", label="Cijena EE")
     ax3.set_ylabel("Cijena [EUR/MWh]", color="darkblue")
     ax3.tick_params(axis="y", labelcolor="darkblue")
     ax3.grid(True, alpha=0.3)
     ax3.axvline(x=24, color="gray", linestyle="--", alpha=0.5)
-
-    ax3_r = ax3.twinx()
-    ax3_r.step(hours, d_afrr_p, where="mid", linewidth=1.5, color="forestgreen", linestyle="-.", label="aFRR+")
-    ax3_r.step(hours, d_afrr_m, where="mid", linewidth=1.5, color="crimson", linestyle="-.", label="aFRR-")
-    ax3_r.set_ylabel("aFRR [MW]", color="gray")
-    ax3_r.tick_params(axis="y", labelcolor="gray")
-
-    lines1, labels1 = ax3.get_legend_handles_labels()
-    lines2, labels2 = ax3_r.get_legend_handles_labels()
-    ax3.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
-    ax3.set_title("Cijena električne energije i aFRR ponuda")
+    ax3.axvline(x=48, color="gray", linestyle="--", alpha=0.5)
+    ax3.legend(loc="upper right", fontsize=8)
+    ax3.set_title("Cijena električne energije")
 
     ax3.set_xlabel("Sat")
-    ax3.set_xticks(range(0, H, 2))
+    ax3.set_xticks(range(0, H, 3))
     ax3.set_xlim(-0.5, H - 0.5)
 
     plt.tight_layout()
