@@ -1,8 +1,8 @@
 {
   "summary": {
     "cost_optimized": 17357.35,
-    "cost_no_battery": 29015.17,
-    "savings": 11657.82,
+    "cost_no_battery": 19368.94,
+    "savings": 2011.58,
     "E_grid_total": 269.88,
     "E_consumption_total": 414.6,
     "E_solar_total": 155.65,
@@ -22,7 +22,9 @@
     "n_bat_min": 3,
     "price_export": 30,
     "eta_charge": 0.95,
-    "eta_discharge": 0.95
+    "eta_discharge": 0.95,
+    "soc_min": 15,
+    "soc_max": 90
   },
   "days": [
     "Monday",
